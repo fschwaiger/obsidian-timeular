@@ -2,14 +2,15 @@ use anyhow::Result;
 use btleplug::api::{Central, CharPropFlags, Manager as _, Peripheral as _, ScanFilter};
 use btleplug::platform::{Adapter, Manager, Peripheral};
 use futures::stream::StreamExt;
+use futures::SinkExt;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, timeout};
+use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 fn tracker_tcp_port() -> u16 {
     env::var("TRACKER_TCP_PORT")
@@ -18,8 +19,12 @@ fn tracker_tcp_port() -> u16 {
         .expect("TRACKER_TCP_PORT must be a valid u16 integer.")
 }
 
-fn tracker_name_prefix() -> String {
-    env::var("TRACKER_NAME_PREFIX").expect("Environment variable TRACKER_NAME_PREFIX must be set.")
+fn tracker_name_prefix() -> Option<String> {
+    env::var("TRACKER_NAME_PREFIX").ok()
+}
+
+fn tracker_mac_address() -> Option<String> {
+    env::var("TRACKER_MAC_ADDRESS").ok()
 }
 
 fn tracker_battery_uuid() -> String {
@@ -75,31 +80,39 @@ async fn run_tcp_server(app_state: Arc<AppState>) -> Result<()> {
 
 async fn handle_client(socket: TcpStream, app_state: Arc<AppState>) -> Result<()> {
     *app_state.connected_clients.write().await += 1;
-    let socket = Arc::new(Mutex::new(socket));
 
-    // Start scanning for device
-    println!("Starting Bluetooth scan...");
+    let ws_stream = match accept_async(socket).await {
+        Ok(ws) => ws,
+        Err(e) => {
+            eprintln!("WebSocket handshake failed: {:?}", e);
+            *app_state.connected_clients.write().await -= 1;
+            return Err(e.into());
+        }
+    };
+
+    let (ws_write, _ws_read) = ws_stream.split();
+    let ws_write = Arc::new(Mutex::new(ws_write));
 
     match timeout(Duration::from_secs(10), find_and_connect_device()).await {
         Ok(Ok((peripheral, adapter))) => {
             println!("Device connected successfully");
 
             // Monitor device and send updates
-            if let Err(e) = monitor_device(peripheral, adapter, socket.clone()).await {
+            if let Err(e) = monitor_device(peripheral, adapter, ws_write.clone()).await {
                 eprintln!("Monitor error: {:?}", e);
             }
         }
         Ok(Err(e)) => {
             eprintln!("Failed to connect to device: {:?}", e);
-            let mut sock = socket.lock().await;
-            sock.write_all(b"{\"error\":\"Device not found\"}\n")
+            let mut ws = ws_write.lock().await;
+            ws.send(Message::Text("{\"error\":\"Device not found\"}".to_string()))
                 .await
                 .ok();
         }
         Err(_) => {
             println!("Timeout: Device not found within 10 seconds");
-            let mut sock = socket.lock().await;
-            sock.write_all(b"{\"error\":\"Timeout - device not found\"}\n")
+            let mut ws = ws_write.lock().await;
+            ws.send(Message::Text("{\"error\":\"Timeout - device not found\"}".to_string()))
                 .await
                 .ok();
         }
@@ -112,41 +125,66 @@ async fn handle_client(socket: TcpStream, app_state: Arc<AppState>) -> Result<()
 async fn find_and_connect_device() -> Result<(Peripheral, Adapter)> {
     let manager = Manager::new().await?;
     let adapters = manager.adapters().await?;
+
     let central = adapters
         .into_iter()
         .next()
         .ok_or_else(|| anyhow::anyhow!("No Bluetooth adapter found"))?;
 
-    central.start_scan(ScanFilter::default()).await?;
+    let scan_filter = ScanFilter::default();
+    central.start_scan(scan_filter).await?;
+    sleep(Duration::from_secs(3)).await;
 
-    // Poll for device for up to 10 seconds
-    for _ in 0..50 {
-        sleep(Duration::from_millis(200)).await;
+    let target_mac = tracker_mac_address();
+    let target_prefix = tracker_name_prefix();
 
+    if target_mac.is_none() && target_prefix.is_none() {
+        anyhow::bail!("Either TRACKER_MAC_ADDRESS or TRACKER_NAME_PREFIX must be set");
+    }
+
+    // Poll for device for up to 15 seconds
+    for _ in 0..60 {
         let peripherals = central.peripherals().await?;
+
         for p in peripherals {
-            if let Some(props) = p.properties().await? {
-                if let Some(name) = props.local_name {
-                    if name.starts_with(&tracker_name_prefix()) {
-                        println!("Found tracker: {}", name);
+            match p.properties().await {
+                Ok(Some(props)) => {
+                    let addr = p.address();
+
+                    let is_match = if let Some(ref target) = target_mac {
+                        let addr_str = addr.to_string().to_uppercase();
+                        let target_upper = target.to_uppercase().replace("-", ":");
+                        addr_str == target_upper
+                    } else if let Some(ref prefix) = target_prefix {
+                        props.local_name.as_ref().map_or(false, |n| n.starts_with(prefix))
+                    } else {
+                        false
+                    };
+
+                    if is_match {
+                        let name = props.local_name.clone().unwrap_or_else(|| String::from("unknown"));
+                        println!("Device found: {} ({})", name, addr);
                         central.stop_scan().await?;
                         p.connect().await?;
                         p.discover_services().await?;
                         return Ok((p, central));
                     }
                 }
+                Ok(None) | Err(_) => {}
             }
         }
+
+        sleep(Duration::from_millis(250)).await;
     }
 
     central.stop_scan().await?;
-    anyhow::bail!("Tracker device not found")
+    anyhow::bail!("Tracker device not found after scanning")
 }
 
 async fn monitor_device(
     peripheral: Peripheral,
     adapter: Adapter,
-    socket: Arc<Mutex<TcpStream>>,
+    ws_write: Arc<Mutex<futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>>>,
 ) -> Result<()> {
     let mut last_battery: Option<u8> = None;
     let mut last_indicator: Option<u8> = None;
@@ -166,7 +204,6 @@ async fn monitor_device(
                     || char.properties.contains(CharPropFlags::INDICATE)
                 {
                     peripheral.subscribe(char).await?;
-                    println!("Subscribed to {}", uuid_str);
 
                     // Read initial value
                     if char.properties.contains(CharPropFlags::READ) {
@@ -188,7 +225,7 @@ async fn monitor_device(
     // Send initial state if we have values
     if let (Some(battery), Some(indicator)) = (last_battery, last_indicator) {
         let state = DeviceState { battery, indicator };
-        send_state(&socket, &state).await?;
+        send_state(&ws_write, &state).await?;
     }
 
     // Listen for notifications
@@ -205,11 +242,9 @@ async fn monitor_device(
                         let mut changed = false;
 
                         if uuid_str == battery_uuid && last_battery != Some(value) {
-                            println!("Battery changed: {}%", value);
                             last_battery = Some(value);
                             changed = true;
                         } else if uuid_str == indicator_uuid && last_indicator != Some(value) {
-                            println!("Indicator changed: {}", value);
                             last_indicator = Some(value);
                             changed = true;
                         }
@@ -217,7 +252,7 @@ async fn monitor_device(
                         if changed {
                             if let (Some(battery), Some(indicator)) = (last_battery, last_indicator) {
                                 let state = DeviceState { battery, indicator };
-                                if let Err(e) = send_state(&socket, &state).await {
+                                if let Err(e) = send_state(&ws_write, &state).await {
                                     eprintln!("Failed to send state: {:?}", e);
                                     break;
                                 }
@@ -225,39 +260,24 @@ async fn monitor_device(
                         }
                     }
                 } else {
-                    println!("Notification stream ended");
                     break;
-                }
-            }
-            _ = async {
-                let sock = socket.lock().await;
-                sock.readable().await
-            } => {
-                // Check if client disconnected
-                let mut buf = [0u8; 1];
-                match socket.lock().await.try_read(&mut buf) {
-                    Ok(0) => {
-                        println!("Client disconnected");
-                        break;
-                    }
-                    _ => {}
                 }
             }
         }
     }
 
-    // Cleanup
-    println!("Disconnecting from device...");
     peripheral.disconnect().await.ok();
     adapter.stop_scan().await.ok();
 
     Ok(())
 }
 
-async fn send_state(socket: &Arc<Mutex<TcpStream>>, state: &DeviceState) -> Result<()> {
+async fn send_state(
+    ws_write: &Arc<Mutex<futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, Message>>>,
+    state: &DeviceState,
+) -> Result<()> {
     let json = serde_json::to_string(state)?;
-    let mut sock = socket.lock().await;
-    sock.write_all(json.as_bytes()).await?;
-    sock.write_all(b"\n").await?;
+    let mut ws = ws_write.lock().await;
+    ws.send(Message::Text(json)).await?;
     Ok(())
 }

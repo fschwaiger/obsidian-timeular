@@ -55,10 +55,12 @@ interface BluetoothTimeTrackerPluginSettings {
 	actionSetsByName: { [key: string]: ActionSet };
 	companionPort: number;
 	companionHost: string;
+	deviceMacAddress: string;
 }
 
 const DEFAULT_SETTINGS: BluetoothTimeTrackerPluginSettings = {
 	deviceName: "Timeular Tracker",
+	deviceMacAddress: "D1:16:15:2C:DE:8B",
 	templateTargetFile: "Daily/{{date}}.md",
 	activeActionSet: "default",
 	companionPort: 9999,
@@ -100,36 +102,29 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 
 	async onConnect() {
 		this.updateState("connecting");
-		
+
 		// Try to start companion if not running
 		if (!this.companionProcess && !this.companionStarting) {
 			await this.startCompanionIfNeeded();
 		}
-		
+
 		try {
-			// Connect via WebSocket to the companion app's TCP server
-			// Note: WebSocket protocol over the companion's TCP port
 			const url = `ws://${this.settings.companionHost}:${this.settings.companionPort}`;
-			console.log(`Connecting to companion app at ${url}...`);
-			
 			this.ws = new WebSocket(url);
-			
+
 			this.ws.onopen = () => {
-				console.log('Connected to companion app');
 				this.updateState("connected");
 			};
-			
+
 			this.ws.onmessage = (event) => {
 				try {
 					const data = JSON.parse(event.data);
-					console.log('Received from companion:', data);
-					
+
 					if (data.error) {
-						console.error('Companion error:', data.error);
 						this.updateState("disconnected");
 						return;
 					}
-					
+
 					if (data.indicator !== undefined) {
 						this.side = decodeSide(data.indicator);
 						this.battery = data.battery || 0;
@@ -139,26 +134,23 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 					console.error('Error parsing message:', error);
 				}
 			};
-			
+
 			this.ws.onerror = (error) => {
 				console.error('WebSocket error:', error);
 				this.updateState("unavailable");
 			};
-			
+
 			this.ws.onclose = () => {
-				console.log('Disconnected from companion app');
 				this.ws = undefined;
 				this.updateState("disconnected");
-				
-				// Auto-reconnect after 5 seconds if we were previously connected
+
 				if (this.state === "connected" || this.state === "connecting") {
 					this.reconnectTimeout = setTimeout(() => {
-						console.log('Attempting to reconnect...');
 						this.onConnect();
 					}, 5000);
 				}
 			};
-			
+
 		} catch (error) {
 			this.updateState("unavailable");
 			console.error('Error connecting to companion app:', error);
@@ -171,13 +163,13 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 			clearTimeout(this.reconnectTimeout);
 			this.reconnectTimeout = undefined;
 		}
-		
+
 		// Close WebSocket if connected
 		if (this.ws) {
 			this.ws.close();
 			this.ws = undefined;
 		}
-		
+
 		this.updateState("disconnected");
 	}
 
@@ -187,13 +179,13 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 			clearTimeout(this.reconnectTimeout);
 			this.reconnectTimeout = undefined;
 		}
-		
+
 		// Close WebSocket
 		if (this.ws) {
 			this.ws.close();
 			this.ws = undefined;
 		}
-		
+
 		this.updateState("disconnected");
 	}
 
@@ -203,78 +195,55 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 		}
 
 		this.companionStarting = true;
-		
+
 		// Get the plugin directory - use the adapter to get the proper file system path
 		const pluginDir = (this.app.vault.adapter as any).getBasePath();
-		const companionDir = path.join(pluginDir, ".obsidian", "plugins", "obsidian-ble-time-tracker", "companion");
-		const binaryPath = path.join(companionDir, "target", "release", "ble_tracker_companion");
-		const debugBinaryPath = path.join(companionDir, "target", "debug", "ble_tracker_companion");
-
-		console.log("Plugin directory:", pluginDir);
-		console.log("Looking for companion at:", companionDir);
-		console.log("Checking release binary:", binaryPath);
-		console.log("Checking debug binary:", debugBinaryPath);
+		const companionDir = path.join(pluginDir, ".obsidian", "plugins", "obsidian-ble-tracker", "companion");
+		const binaryPath = path.join(companionDir, "target", "release", "ble_tracker_companion.exe");
+		const debugBinaryPath = path.join(companionDir, "target", "debug", "ble_tracker_companion.exe");
 
 		try {
-			// Check if binary exists, prefer release build
 			let execPath: string;
 			if (existsSync(binaryPath)) {
 				execPath = binaryPath;
-				console.log("✓ Using release build of companion");
 			} else if (existsSync(debugBinaryPath)) {
 				execPath = debugBinaryPath;
-				console.log("✓ Using debug build of companion");
 			} else {
-				console.error("✗ No companion binary found at either path");
 				new Notice("Companion app not built. Please run 'cd companion && cargo build'");
 				this.updateState("unavailable");
 				this.companionStarting = false;
 				return;
 			}
 
-			// Start the companion process
-			console.log("Starting companion app...");
-			console.log("Executable path:", execPath);
-			
-			// Use shell to ensure proper library paths are loaded
 			this.companionProcess = spawn(execPath, [], {
 				env: {
 					...process.env,
 					TRACKER_TCP_PORT: String(this.settings.companionPort),
-					TRACKER_NAME_PREFIX: this.settings.deviceName.split(" ")[0], // e.g., "Timeular"
+					TRACKER_MAC_ADDRESS: this.settings.deviceMacAddress,
 					TRACKER_BATTERY_UUID: "00002a19-0000-1000-8000-00805f9b34fb",
 					TRACKER_INDICATOR_UUID: "c7e70012-c847-11e6-8175-8c89a55d403c",
 				},
 				cwd: companionDir,
 				stdio: ['ignore', 'pipe', 'pipe'],
-				shell: true // Use shell to get proper environment
-			});
-
-			this.companionProcess.stdout?.on('data', (data) => {
-				console.log(`Companion: ${data.toString()}`);
 			});
 
 			this.companionProcess.stderr?.on('data', (data) => {
-				console.error(`Companion error: ${data}`);
+				console.error(`Companion: ${data}`);
 			});
 
-			this.companionProcess.on('exit', (code, signal) => {
-				console.log(`Companion exited with code ${code}, signal ${signal}`);
+			this.companionProcess.on('exit', (code) => {
 				this.companionProcess = undefined;
-				
-				// If exited immediately with error, likely a library issue
+
 				if (code !== 0 && code !== null) {
-					new Notice(`Companion app failed to start (exit code: ${code}). Check console for details.`);
+					new Notice(`Companion failed (exit code: ${code})`);
 				}
-				
+
 				if (this.state === "connected" || this.state === "connecting") {
 					this.updateState("disconnected");
 				}
 			});
 
-			// Wait a bit for the companion to start
 			await new Promise(resolve => setTimeout(resolve, 2000));
-			console.log("Companion app started");
 
 		} catch (error) {
 			console.error("Failed to start companion:", error);
@@ -287,7 +256,6 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 
 	stopCompanion() {
 		if (this.companionProcess) {
-			console.log("Stopping companion app...");
 			this.companionProcess.kill();
 			this.companionProcess = undefined;
 		}
@@ -312,7 +280,7 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 		this.statusBarItemEl.addEventListener("click", this.onReconnect.bind(this));
 
 		this.addSettingTab(new BluetoothTimeTrackerSettingTab(this.app, this));
-		
+
 		this.updateState("disconnected");
 	}
 
@@ -380,10 +348,10 @@ class BluetoothTimeTrackerSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 
 		containerEl.empty();
-		
+
 		containerEl.createEl("h2", { text: "Bluetooth Time Tracker Settings" });
-		
-		containerEl.createEl("p", { 
+
+		containerEl.createEl("p", {
 			text: "This plugin requires the companion app to be running. The companion app handles Bluetooth communication with your device.",
 			cls: "setting-item-description"
 		});
@@ -416,13 +384,26 @@ class BluetoothTimeTrackerSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Device Name")
-			.setDesc("The name of the time tracker device")
+			.setDesc("The name of the time tracker device (for display only)")
 			.addText((text) =>
 				text
-					.setPlaceholder("Enter the device name")
+					.setPlaceholder("Timeular Tracker")
 					.setValue(this.plugin.settings.deviceName)
 					.onChange(async (value) => {
 						this.plugin.settings.deviceName = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Device MAC Address")
+			.setDesc("The Bluetooth MAC address of your device (e.g., D1:16:15:2C:DE:8B)")
+			.addText((text) =>
+				text
+					.setPlaceholder("D1:16:15:2C:DE:8B")
+					.setValue(this.plugin.settings.deviceMacAddress)
+					.onChange(async (value) => {
+						this.plugin.settings.deviceMacAddress = value;
 						await this.plugin.saveSettings();
 					})
 			);
