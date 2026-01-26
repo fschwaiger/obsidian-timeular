@@ -50,15 +50,27 @@ interface BluetoothTimeTrackerPluginSettings {
 }
 
 const SIDE_COLORS: { [key in Side]?: string } = {
-	"BF": "#535353",
-	"BR": "#1e706b",
-	"BL": "#d6761b",
-	"BB": "#2819b1",
 	"TF": "#7bb33b",
 	"TR": "#e6e21a",
 	"TL": "#cc2594",
 	"TB": "#22a8c0",
+	"BF": "#535353",
+	"BR": "#1e706b",
+	"BL": "#d6761b",
+	"BB": "#4232d3",
 };
+
+const SIDE_NUMBERS: { [key in Side]?: number } = {
+    "TF": 1,
+    "TL": 2,
+    "TB": 3,
+    "TR": 4,
+    "BF": 5,
+    "BL": 6,
+    "BB": 7,
+    "BR": 8,
+};
+
 
 const DEFAULT_SETTINGS: BluetoothTimeTrackerPluginSettings = {
 	deviceName: "Timeular Tracker",
@@ -67,14 +79,14 @@ const DEFAULT_SETTINGS: BluetoothTimeTrackerPluginSettings = {
 	companionPort: 9999,
 	companionHost: "127.0.0.1",
 	sideLabels: {
-		"BF": "Bottom Front",
-		"BR": "Bottom Right",
-		"BL": "Bottom Left",
-		"BB": "Bottom Back",
 		"TF": "Top Front",
 		"TR": "Top Right",
 		"TL": "Top Left",
 		"TB": "Top Back",
+		"BF": "Bottom Front",
+		"BR": "Bottom Right",
+		"BL": "Bottom Left",
+		"BB": "Bottom Back",
 	},
 };
 
@@ -417,7 +429,7 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 			border-bottom: 1px solid var(--background-modifier-border);
 		`;
 
-		const sides: Side[] = ["BF", "BR", "BL", "BB", "TF", "TR", "TL", "TB"];
+		const sides: Side[] = ["TF", "TL", "TB", "TR", "BF", "BL", "BB", "BR"];
 
 		sides.forEach(side => {
 			const row = popover.createDiv();
@@ -429,21 +441,17 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 			`;
 
 			const colorCircle = row.createDiv();
+            colorCircle.textContent = SIDE_NUMBERS[side]?.toString() || side;
 			colorCircle.style.cssText = `
-				width: 16px;
-				height: 16px;
+				width: 24px;
+				height: 24px;
 				border-radius: 50%;
 				background-color: ${SIDE_COLORS[side]};
 				flex-shrink: 0;
-			`;
-
-			const sideCode = row.createSpan();
-			sideCode.textContent = side;
-			sideCode.style.cssText = `
-				font-family: monospace;
-				width: 30px;
-				flex-shrink: 0;
-				font-size: 0.9em;
+                text-align: center;
+                line-height: 24px;
+                color: black;
+                font-weight: bold;
 			`;
 
 			const input = row.createEl("input", {
