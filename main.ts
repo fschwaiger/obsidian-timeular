@@ -5,6 +5,8 @@ import {
 	Setting,
 	addIcon,
 	Notice,
+	TFile,
+	moment,
 } from "obsidian";
 import { ChildProcess, spawn } from "child_process";
 import * as path from "path";
@@ -13,32 +15,22 @@ import { existsSync } from "fs";
 type Side = "BF" | "BR" | "BL" | "BB" | "TF" | "TR" | "TL" | "TB" | "__";
 type State = "disconnected" | "connecting" | "connected" | "unavailable";
 
-type Action = {
-	command?: string;
-	template?: string;
-	actionSet?: string;
-};
-
-type ActionSet = {
-	[key in Side]: Action;
-};
-
 function decodeSide(
 	data: number
 ): Side {
 	switch (data) {
 		case 0x01:
-			return "BF";
-		case 0x02:
 			return "BR";
+		case 0x02:
+			return "BF";
 		case 0x03:
 			return "BL";
 		case 0x04:
 			return "BB";
 		case 0x05:
-			return "TF";
-		case 0x06:
 			return "TR";
+		case 0x06:
+			return "TF";
 		case 0x07:
 			return "TL";
 		case 0x08:
@@ -51,30 +43,38 @@ function decodeSide(
 interface BluetoothTimeTrackerPluginSettings {
 	deviceName: string;
 	templateTargetFile: string;
-	activeActionSet: string;
-	actionSetsByName: { [key: string]: ActionSet };
 	companionPort: number;
 	companionHost: string;
 	deviceMacAddress: string;
+	sideLabels: { [key in Side]?: string };
 }
+
+const SIDE_COLORS: { [key in Side]?: string } = {
+	"BF": "#535353",
+	"BR": "#1e706b",
+	"BL": "#d6761b",
+	"BB": "#2819b1",
+	"TF": "#7bb33b",
+	"TR": "#e6e21a",
+	"TL": "#cc2594",
+	"TB": "#22a8c0",
+};
 
 const DEFAULT_SETTINGS: BluetoothTimeTrackerPluginSettings = {
 	deviceName: "Timeular Tracker",
 	deviceMacAddress: "D1:16:15:2C:DE:8B",
 	templateTargetFile: "Daily/{{date}}.md",
-	activeActionSet: "default",
 	companionPort: 9999,
 	companionHost: "127.0.0.1",
-	actionSetsByName: {
-		default: ["BF", "BR", "BL", "BB", "TF", "TR", "TL", "TB", "__"].reduce(
-			(set: ActionSet, side: Side) => {
-				set[side] = {
-					template: `{{time}} ${side}`,
-				};
-				return set;
-			},
-			{} as ActionSet
-		),
+	sideLabels: {
+		"BF": "Bottom Front",
+		"BR": "Bottom Right",
+		"BL": "Bottom Left",
+		"BB": "Bottom Back",
+		"TF": "Top Front",
+		"TR": "Top Right",
+		"TL": "Top Left",
+		"TB": "Top Back",
 	},
 };
 
@@ -86,6 +86,8 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 	ws: WebSocket | undefined = undefined;
 	statusBarItemEl: HTMLElement;
 	ribbonIconEl: HTMLElement;
+	popoverEl: HTMLElement | undefined;
+	popoverCloseHandler: ((e: MouseEvent) => void) | undefined;
 	reconnectTimeout: NodeJS.Timeout | undefined;
 	companionProcess: ChildProcess | undefined = undefined;
 	companionStarting: boolean = false;
@@ -126,9 +128,21 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 					}
 
 					if (data.indicator !== undefined) {
-						this.side = decodeSide(data.indicator);
-						this.battery = data.battery || 0;
-						this.updateState("connected");
+					const newSide = decodeSide(data.indicator);
+					const previousSide = this.side;
+
+					this.side = newSide;
+					this.battery = data.battery || 0;
+					this.updateState("connected");
+
+					// Only log and write if side changed and is not "__"
+					if (this.side !== "__" && previousSide !== this.side) {
+						const sideLabel = this.settings.sideLabels[this.side] || this.side;
+						console.log(`Side triggered: ${this.side} - ${sideLabel}`);
+
+						// Write to daily note
+						this.appendToDailyNote(this.side, sideLabel);
+					}
 					}
 				} catch (error) {
 					console.error('Error parsing message:', error);
@@ -189,12 +203,41 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 		this.updateState("disconnected");
 	}
 
+	async checkPortInUse(port: number): Promise<boolean> {
+		return new Promise((resolve) => {
+			const net = require('net');
+			const tester = net.createServer()
+				.once('error', (err: any) => {
+					if (err.code === 'EADDRINUSE') {
+						resolve(true);
+					} else {
+						resolve(false);
+					}
+				})
+				.once('listening', () => {
+					tester.once('close', () => {
+						resolve(false);
+					});
+					tester.close();
+				})
+				.listen(port, '127.0.0.1');
+		});
+	}
+
 	async startCompanionIfNeeded() {
 		if (this.companionStarting || this.companionProcess) {
 			return;
 		}
 
 		this.companionStarting = true;
+
+		// Check if companion is already running on the port
+		const isPortInUse = await this.checkPortInUse(this.settings.companionPort);
+		if (isPortInUse) {
+			console.log(`Companion already running on port ${this.settings.companionPort}`);
+			this.companionStarting = false;
+			return;
+		}
 
 		// Get the plugin directory - use the adapter to get the proper file system path
 		const pluginDir = (this.app.vault.adapter as any).getBasePath();
@@ -272,7 +315,7 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 		this.ribbonIconEl = this.addRibbonIcon(
 			"time-tracker",
 			"Time Tracker",
-			this.onReconnect.bind(this)
+			(evt: MouseEvent) => this.showSideLabelsPopover(evt)
 		);
 
 		this.statusBarItemEl = this.addStatusBarItem();
@@ -284,7 +327,195 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 		this.updateState("disconnected");
 	}
 
+	async appendToDailyNote(side: Side, label: string) {
+		try {
+			const dailyNotesPlugin = (this.app as any).internalPlugins?.plugins?.["daily-notes"];
+			const dailyNotesEnabled = dailyNotesPlugin?.enabled;
+
+			let dailyNote: TFile | null = null;
+
+			if (dailyNotesEnabled) {
+				// Use daily notes plugin API if available
+				const { getDailyNote, createDailyNote, getAllDailyNotes } = (window as any).ObsidianDailyNotesInterface || {};
+
+				if (getDailyNote && createDailyNote) {
+					const allDailyNotes = getAllDailyNotes?.() || {};
+					const today = moment();
+					dailyNote = getDailyNote(today, allDailyNotes);
+
+					if (!dailyNote) {
+						dailyNote = await createDailyNote(today);
+					}
+				}
+			}
+
+			// Fallback: try to find/create daily note manually
+			if (!dailyNote) {
+				const dateFormat = "YYYY-MM-DD";
+				const today = moment().format(dateFormat);
+				const dailyNotePath = `Daily/${today}.md`;
+
+				dailyNote = this.app.vault.getAbstractFileByPath(dailyNotePath) as TFile;
+
+				if (!dailyNote) {
+					// Create the daily note
+					const folder = this.app.vault.getAbstractFileByPath("Daily");
+					if (!folder) {
+						await this.app.vault.createFolder("Daily");
+					}
+					dailyNote = await this.app.vault.create(dailyNotePath, "");
+				}
+			}
+
+			if (dailyNote) {
+				const timestamp = moment().format("HH:mm");
+				const line = `\n${timestamp} ${label}`;
+
+				const currentContent = await this.app.vault.read(dailyNote);
+				await this.app.vault.modify(dailyNote, currentContent + line);
+			}
+		} catch (error) {
+			console.error("Failed to append to daily note:", error);
+		}
+	}
+
+	showSideLabelsPopover(evt: MouseEvent) {
+		// Close existing popover if any
+		if (this.popoverEl) {
+			this.popoverEl.remove();
+			this.popoverEl = undefined;
+			if (this.popoverCloseHandler) {
+				document.removeEventListener("click", this.popoverCloseHandler);
+				this.popoverCloseHandler = undefined;
+			}
+			evt.stopPropagation();
+			return;
+		}
+
+		this.popoverEl = document.body.createDiv("time-tracker-popover");
+		const popover = this.popoverEl;
+
+		popover.style.cssText = `
+			position: fixed;
+			top: ${evt.clientY + 10}px;
+			left: ${evt.clientX + 10}px;
+			background: var(--background-primary);
+			border: 1px solid var(--background-modifier-border);
+			border-radius: 8px;
+			padding: 12px;
+			box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+			z-index: 1000;
+			min-width: 300px;
+		`;
+
+		const title = popover.createDiv();
+		title.textContent = "Assigned Tracker Actions";
+		title.style.cssText = `
+			font-weight: bold;
+			margin-bottom: 12px;
+			padding-bottom: 8px;
+			border-bottom: 1px solid var(--background-modifier-border);
+		`;
+
+		const sides: Side[] = ["BF", "BR", "BL", "BB", "TF", "TR", "TL", "TB"];
+
+		sides.forEach(side => {
+			const row = popover.createDiv();
+			row.style.cssText = `
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				margin-bottom: 8px;
+			`;
+
+			const colorCircle = row.createDiv();
+			colorCircle.style.cssText = `
+				width: 16px;
+				height: 16px;
+				border-radius: 50%;
+				background-color: ${SIDE_COLORS[side]};
+				flex-shrink: 0;
+			`;
+
+			const sideCode = row.createSpan();
+			sideCode.textContent = side;
+			sideCode.style.cssText = `
+				font-family: monospace;
+				width: 30px;
+				flex-shrink: 0;
+				font-size: 0.9em;
+			`;
+
+			const input = row.createEl("input", {
+				type: "text",
+				value: this.settings.sideLabels[side] || "",
+				placeholder: `Label for ${side}`,
+			});
+			input.style.cssText = `
+				flex: 1;
+				padding: 4px 8px;
+				border: 1px solid var(--background-modifier-border);
+				border-radius: 4px;
+				background: var(--background-primary-alt);
+				color: var(--text-normal);
+			`;
+
+			input.addEventListener("input", async () => {
+				this.settings.sideLabels[side] = input.value;
+				await this.saveSettings();
+			});
+		});
+
+		const footer = popover.createDiv();
+		footer.style.cssText = `
+			margin-top: 12px;
+			padding-top: 8px;
+			border-top: 1px solid var(--background-modifier-border);
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+			font-size: 0.85em;
+			color: var(--text-muted);
+		`;
+
+		const statusText = footer.createSpan();
+		statusText.textContent = `Status: ${this.state}`;
+
+		const connectBtn = footer.createEl("button");
+		connectBtn.textContent = this.state === "connected" ? "Disconnect" : "Connect";
+		connectBtn.style.cssText = `
+			padding: 4px 12px;
+			border-radius: 4px;
+			cursor: pointer;
+		`;
+		connectBtn.addEventListener("click", () => {
+			this.onReconnect();
+			statusText.textContent = `Status: ${this.state}`;
+		});
+
+		// Close popover when clicking outside
+		setTimeout(() => {
+			this.popoverCloseHandler = (e: MouseEvent) => {
+				if (this.popoverEl && !this.popoverEl.contains(e.target as Node) && e.target !== this.ribbonIconEl && !this.ribbonIconEl.contains(e.target as Node)) {
+					this.popoverEl.remove();
+					this.popoverEl = undefined;
+					if (this.popoverCloseHandler) {
+						document.removeEventListener("click", this.popoverCloseHandler);
+						this.popoverCloseHandler = undefined;
+					}
+				}
+			};
+			document.addEventListener("click", this.popoverCloseHandler);
+		}, 100);
+	}
+
 	onunload() {
+		if (this.popoverEl) {
+			this.popoverEl.remove();
+		}
+		if (this.popoverCloseHandler) {
+			document.removeEventListener("click", this.popoverCloseHandler);
+		}
 		// Clean up on plugin unload
 		if (this.reconnectTimeout) {
 			clearTimeout(this.reconnectTimeout);
@@ -319,7 +550,21 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 			this.ribbonIconEl.style.opacity = "1.0";
 			this.ribbonIconEl.style.color = "rgb(50, 200, 0)";
 			const batteryInfo = this.battery ? ` ${this.battery}%` : '';
-			this.statusBarItemEl.setText(`◇${batteryInfo} <${this.side || 'N/A'}>`);
+
+			// Create colored circle for status bar
+			this.statusBarItemEl.empty();
+			const circle = this.statusBarItemEl.createSpan();
+			circle.style.cssText = `
+				display: inline-block;
+				width: 10px;
+				height: 10px;
+				border-radius: 50%;
+                border: 1px solid #999;
+				background-color: ${SIDE_COLORS[this.side] || '#999'};
+				margin-right: 6px;
+                margin-top: -1px;
+			`;
+			this.statusBarItemEl.appendText(`${batteryInfo}`);
 		} else if (this.state == "connecting") {
 			this.ribbonIconEl.style.opacity = "1.0";
 			this.ribbonIconEl.style.color = "rgb(80, 160, 255)";
