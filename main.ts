@@ -4,29 +4,11 @@ import {
 	PluginSettingTab,
 	Setting,
 	addIcon,
+	Notice,
 } from "obsidian";
-
-import { BrowserWindow } from "electron";
-const { remote } = require('electron');
-
-let cancelScanning = () => {};
-
-let win: Electron.BrowserWindow = remote.BrowserWindow.getFocusedWindow();
-win?.webContents.on('select-bluetooth-device', (event, deviceList, callback) => {
-	event.preventDefault()
-	console.log('discovering devices...')
-	console.log(deviceList.map((device) => device.deviceName))
-	cancelScanning = () => { callback('') }
-	const result = deviceList.find((device) => {
-	  return device.deviceName.startsWith('Timeular')
-	})
-	if (result) {
-	  callback(result.deviceId)
-	} else {
-	  // The device wasn't found so we need to either wait longer (eg until the
-	  // device is turned on) or until the user cancels the request
-	}
-  })
+import { ChildProcess, spawn } from "child_process";
+import * as path from "path";
+import { existsSync } from "fs";
 
 type Side = "BF" | "BR" | "BL" | "BB" | "TF" | "TR" | "TL" | "TB" | "__";
 type State = "disconnected" | "connecting" | "connected" | "unavailable";
@@ -71,12 +53,16 @@ interface BluetoothTimeTrackerPluginSettings {
 	templateTargetFile: string;
 	activeActionSet: string;
 	actionSetsByName: { [key: string]: ActionSet };
+	companionPort: number;
+	companionHost: string;
 }
 
 const DEFAULT_SETTINGS: BluetoothTimeTrackerPluginSettings = {
 	deviceName: "Timeular Tracker",
 	templateTargetFile: "Daily/{{date}}.md",
 	activeActionSet: "default",
+	companionPort: 9999,
+	companionHost: "127.0.0.1",
 	actionSetsByName: {
 		default: ["BF", "BR", "BL", "BB", "TF", "TR", "TL", "TB", "__"].reduce(
 			(set: ActionSet, side: Side) => {
@@ -90,16 +76,17 @@ const DEFAULT_SETTINGS: BluetoothTimeTrackerPluginSettings = {
 	},
 };
 
-const NOTIFICATION_SERVICE_UUID = "c7e70012-c847-11e6-8175-8c89a55d403c";
-const NOTIFICATION_CHARACTERISTIC_UUID = "c7e70012-c847-11e6-8175-8c89a55d403c";
-
 export default class BluetoothTimeTrackerPlugin extends Plugin {
 	settings: BluetoothTimeTrackerPluginSettings;
 	state: State = "disconnected";
 	side: Side;
-	device: BluetoothDevice | undefined = undefined;
+	battery: number = 0;
+	ws: WebSocket | undefined = undefined;
 	statusBarItemEl: HTMLElement;
 	ribbonIconEl: HTMLElement;
+	reconnectTimeout: NodeJS.Timeout | undefined;
+	companionProcess: ChildProcess | undefined = undefined;
+	companionStarting: boolean = false;
 
 	async onReconnect() {
 		if (this.state === "disconnected" || this.state == "unavailable") {
@@ -113,41 +100,197 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 
 	async onConnect() {
 		this.updateState("connecting");
-		if (!await navigator.bluetooth?.getAvailability()) {
-			this.updateState("unavailable");
-			return;
+		
+		// Try to start companion if not running
+		if (!this.companionProcess && !this.companionStarting) {
+			await this.startCompanionIfNeeded();
 		}
-
-		navigator.bluetooth.requestDevice({ filters: [{ name: 'Timeular Tra' }] })
-		.then(device => {
-			this.device = device;
-			return this.device.gatt?.connect();
-		})
-		.then(server => server?.getPrimaryService(NOTIFICATION_SERVICE_UUID))
-		.then(service => service?.getCharacteristic(NOTIFICATION_CHARACTERISTIC_UUID))
-		.then(characteristic => {
-			characteristic?.addEventListener('characteristicvaluechanged', this.onSideChange);
-			characteristic?.startNotifications();
-		})
-		.then(() => {
-			this.updateState("connected");
-			console.log('Connected and listening for notifications...');
-		})
-		.catch(error => {
-			this.updateState("disconnected");
-			console.error('Error connecting to device:', error);
-		});
+		
+		try {
+			// Connect via WebSocket to the companion app's TCP server
+			// Note: WebSocket protocol over the companion's TCP port
+			const url = `ws://${this.settings.companionHost}:${this.settings.companionPort}`;
+			console.log(`Connecting to companion app at ${url}...`);
+			
+			this.ws = new WebSocket(url);
+			
+			this.ws.onopen = () => {
+				console.log('Connected to companion app');
+				this.updateState("connected");
+			};
+			
+			this.ws.onmessage = (event) => {
+				try {
+					const data = JSON.parse(event.data);
+					console.log('Received from companion:', data);
+					
+					if (data.error) {
+						console.error('Companion error:', data.error);
+						this.updateState("disconnected");
+						return;
+					}
+					
+					if (data.indicator !== undefined) {
+						this.side = decodeSide(data.indicator);
+						this.battery = data.battery || 0;
+						this.updateState("connected");
+					}
+				} catch (error) {
+					console.error('Error parsing message:', error);
+				}
+			};
+			
+			this.ws.onerror = (error) => {
+				console.error('WebSocket error:', error);
+				this.updateState("unavailable");
+			};
+			
+			this.ws.onclose = () => {
+				console.log('Disconnected from companion app');
+				this.ws = undefined;
+				this.updateState("disconnected");
+				
+				// Auto-reconnect after 5 seconds if we were previously connected
+				if (this.state === "connected" || this.state === "connecting") {
+					this.reconnectTimeout = setTimeout(() => {
+						console.log('Attempting to reconnect...');
+						this.onConnect();
+					}, 5000);
+				}
+			};
+			
+		} catch (error) {
+			this.updateState("unavailable");
+			console.error('Error connecting to companion app:', error);
+		}
 	}
 
 	async onCancel() {
-		cancelScanning();
+		// Clear any reconnect timeout
+		if (this.reconnectTimeout) {
+			clearTimeout(this.reconnectTimeout);
+			this.reconnectTimeout = undefined;
+		}
+		
+		// Close WebSocket if connected
+		if (this.ws) {
+			this.ws.close();
+			this.ws = undefined;
+		}
+		
 		this.updateState("disconnected");
 	}
 
 	async onDisconnect() {
-		this.device?.gatt?.disconnect();
-		this.device = undefined;
+		// Clear any reconnect timeout
+		if (this.reconnectTimeout) {
+			clearTimeout(this.reconnectTimeout);
+			this.reconnectTimeout = undefined;
+		}
+		
+		// Close WebSocket
+		if (this.ws) {
+			this.ws.close();
+			this.ws = undefined;
+		}
+		
 		this.updateState("disconnected");
+	}
+
+	async startCompanionIfNeeded() {
+		if (this.companionStarting || this.companionProcess) {
+			return;
+		}
+
+		this.companionStarting = true;
+		
+		// Get the plugin directory - use the adapter to get the proper file system path
+		const pluginDir = (this.app.vault.adapter as any).getBasePath();
+		const companionDir = path.join(pluginDir, ".obsidian", "plugins", "obsidian-ble-time-tracker", "companion");
+		const binaryPath = path.join(companionDir, "target", "release", "ble_tracker_companion");
+		const debugBinaryPath = path.join(companionDir, "target", "debug", "ble_tracker_companion");
+
+		console.log("Plugin directory:", pluginDir);
+		console.log("Looking for companion at:", companionDir);
+		console.log("Checking release binary:", binaryPath);
+		console.log("Checking debug binary:", debugBinaryPath);
+
+		try {
+			// Check if binary exists, prefer release build
+			let execPath: string;
+			if (existsSync(binaryPath)) {
+				execPath = binaryPath;
+				console.log("✓ Using release build of companion");
+			} else if (existsSync(debugBinaryPath)) {
+				execPath = debugBinaryPath;
+				console.log("✓ Using debug build of companion");
+			} else {
+				console.error("✗ No companion binary found at either path");
+				new Notice("Companion app not built. Please run 'cd companion && cargo build'");
+				this.updateState("unavailable");
+				this.companionStarting = false;
+				return;
+			}
+
+			// Start the companion process
+			console.log("Starting companion app...");
+			console.log("Executable path:", execPath);
+			
+			// Use shell to ensure proper library paths are loaded
+			this.companionProcess = spawn(execPath, [], {
+				env: {
+					...process.env,
+					TRACKER_TCP_PORT: String(this.settings.companionPort),
+					TRACKER_NAME_PREFIX: this.settings.deviceName.split(" ")[0], // e.g., "Timeular"
+					TRACKER_BATTERY_UUID: "00002a19-0000-1000-8000-00805f9b34fb",
+					TRACKER_INDICATOR_UUID: "c7e70012-c847-11e6-8175-8c89a55d403c",
+				},
+				cwd: companionDir,
+				stdio: ['ignore', 'pipe', 'pipe'],
+				shell: true // Use shell to get proper environment
+			});
+
+			this.companionProcess.stdout?.on('data', (data) => {
+				console.log(`Companion: ${data.toString()}`);
+			});
+
+			this.companionProcess.stderr?.on('data', (data) => {
+				console.error(`Companion error: ${data}`);
+			});
+
+			this.companionProcess.on('exit', (code, signal) => {
+				console.log(`Companion exited with code ${code}, signal ${signal}`);
+				this.companionProcess = undefined;
+				
+				// If exited immediately with error, likely a library issue
+				if (code !== 0 && code !== null) {
+					new Notice(`Companion app failed to start (exit code: ${code}). Check console for details.`);
+				}
+				
+				if (this.state === "connected" || this.state === "connecting") {
+					this.updateState("disconnected");
+				}
+			});
+
+			// Wait a bit for the companion to start
+			await new Promise(resolve => setTimeout(resolve, 2000));
+			console.log("Companion app started");
+
+		} catch (error) {
+			console.error("Failed to start companion:", error);
+			new Notice("Failed to start companion app. Check console for details.");
+			this.updateState("unavailable");
+		} finally {
+			this.companionStarting = false;
+		}
+	}
+
+	stopCompanion() {
+		if (this.companionProcess) {
+			console.log("Stopping companion app...");
+			this.companionProcess.kill();
+			this.companionProcess = undefined;
+		}
 	}
 
 	async onload() {
@@ -173,13 +316,16 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 		this.updateState("disconnected");
 	}
 
-	onunload() {}
-
-	onSideChange(event: Event) {
-		let value = (event.target as BluetoothRemoteGATTCharacteristic).value;
-		this.side = decodeSide(value?.getUint8(0) || 0x00);
-		this.updateState();
-		console.log(this.side);
+	onunload() {
+		// Clean up on plugin unload
+		if (this.reconnectTimeout) {
+			clearTimeout(this.reconnectTimeout);
+		}
+		if (this.ws) {
+			this.ws.close();
+		}
+		// Stop the companion app
+		this.stopCompanion();
 	}
 
 	async loadSettings() {
@@ -204,7 +350,8 @@ export default class BluetoothTimeTrackerPlugin extends Plugin {
 		if (this.state == "connected") {
 			this.ribbonIconEl.style.opacity = "1.0";
 			this.ribbonIconEl.style.color = "rgb(50, 200, 0)";
-			this.statusBarItemEl.setText(`◇ N/A <${this.side}>`);
+			const batteryInfo = this.battery ? ` ${this.battery}%` : '';
+			this.statusBarItemEl.setText(`◇${batteryInfo} <${this.side || 'N/A'}>`);
 		} else if (this.state == "connecting") {
 			this.ribbonIconEl.style.opacity = "1.0";
 			this.ribbonIconEl.style.color = "rgb(80, 160, 255)";
@@ -233,6 +380,39 @@ class BluetoothTimeTrackerSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 
 		containerEl.empty();
+		
+		containerEl.createEl("h2", { text: "Bluetooth Time Tracker Settings" });
+		
+		containerEl.createEl("p", { 
+			text: "This plugin requires the companion app to be running. The companion app handles Bluetooth communication with your device.",
+			cls: "setting-item-description"
+		});
+
+		new Setting(containerEl)
+			.setName("Companion Host")
+			.setDesc("The host address of the companion app")
+			.addText((text) =>
+				text
+					.setPlaceholder("127.0.0.1")
+					.setValue(this.plugin.settings.companionHost)
+					.onChange(async (value) => {
+						this.plugin.settings.companionHost = value;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Companion Port")
+			.setDesc("The TCP port of the companion app")
+			.addText((text) =>
+				text
+					.setPlaceholder("9999")
+					.setValue(String(this.plugin.settings.companionPort))
+					.onChange(async (value) => {
+						this.plugin.settings.companionPort = parseInt(value) || 9999;
+						await this.plugin.saveSettings();
+					})
+			);
 
 		new Setting(containerEl)
 			.setName("Device Name")

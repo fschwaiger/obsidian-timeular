@@ -10,10 +10,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{sleep, timeout};
-use tray_icon::{
-    menu::{Menu, MenuItem},
-    TrayIconBuilder,
-};
 
 fn tracker_tcp_port() -> u16 {
     env::var("TRACKER_TCP_PORT")
@@ -50,44 +46,13 @@ struct AppState {
 async fn main() {
     println!("Tracker Companion starting...");
 
-    // Initialize GTK for tray icon
-    gtk::init().expect("Failed to initialize GTK");
-
     let app_state = Arc::new(AppState {
         connected_clients: Arc::new(RwLock::new(0)),
     });
 
-    // Setup system tray
-    let tray_menu = Menu::new();
-    let quit_item = MenuItem::new("Quit", true, None);
-    tray_menu.append(&quit_item).ok();
-
-    let icon_data = create_tray_icon();
-    let _tray_icon = TrayIconBuilder::new()
-        .with_menu(Box::new(tray_menu))
-        .with_icon(tray_icon::Icon::from_rgba(icon_data, 32, 32).expect("Failed to create icon"))
-        .with_tooltip("Tracker Companion")
-        .build()
-        .expect("Failed to create tray icon");
-
-    println!("System tray initialized");
-    println!("Starting TCP server on port {}", tracker_tcp_port());
-
-    // Start TCP server
     if let Err(e) = run_tcp_server(app_state).await {
         eprintln!("TCP server error: {:?}", e);
     }
-}
-
-fn create_tray_icon() -> Vec<u8> {
-    let mut icon_data = vec![0u8; 32 * 32 * 4];
-    for i in (0..icon_data.len()).step_by(4) {
-        icon_data[i] = 50; // R
-        icon_data[i + 1] = 150; // G
-        icon_data[i + 2] = 250; // B
-        icon_data[i + 3] = 255; // A
-    }
-    icon_data
 }
 
 async fn run_tcp_server(app_state: Arc<AppState>) -> Result<()> {

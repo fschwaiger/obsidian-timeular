@@ -3,10 +3,63 @@
 This plugin for [Obsidian](https://obsidian.md) connects via Bluetooth Low Energy (BLE) to your time tracker device, such as the [Timeular tracker](https://timeular.com/tracker/) to trigger actions in your vault when the tracker is moved:
 
 1. It can insert a timestamp and custom text into your daily note.
-2. It can trigger vault actions (e.g. from other plugins) on state change. 
+2. It can trigger vault actions (e.g. from other plugins) on state change.
 
+## Architecture
 
-TODO below
+This plugin uses a **companion app** architecture with automatic process management:
+
+- **Companion App** (Rust): A native application that handles the Bluetooth connection to your device. It sends device state updates over TCP.
+- **Obsidian Plugin** (TypeScript): Automatically starts the companion app if needed, connects via WebSocket to receive device updates, and triggers vault actions.
+
+## Setup Instructions
+
+### 1. Build the Companion App
+
+Build the companion app once:
+
+```bash
+cd companion
+cargo build --release  # or just 'cargo build' for debug build
+```
+
+The plugin will automatically use the release build if available, otherwise it will use the debug build.
+
+### 2. Install the Obsidian Plugin
+
+Copy the plugin files to your vault:
+
+```bash
+cp main.js manifest.json /path/to/your/vault/.obsidian/plugins/obsidian-ble-time-tracker/
+```
+
+Or build from source:
+
+```bash
+npm install
+npm run build
+```
+
+### 3. Use the Plugin
+
+1. Enable the plugin in Obsidian settings
+2. Click the ribbon icon or status bar item to connect
+
+**That's it!** The plugin will automatically:
+- Start the companion app if it's not running
+- Connect to your Bluetooth device
+- Display device status in the status bar
+- Clean up the companion process when the plugin is unloaded
+
+## Configuration
+
+Open plugin settings to configure:
+- **Companion Host**: Default `127.0.0.1` (localhost)
+- **Companion Port**: Default `9999`
+- **Device Name**: Your tracker device name (e.g., "Timeular Tracker")
+- **Template Target File**: Where to write time entries
+
+## Development
 
 ------------------
 
